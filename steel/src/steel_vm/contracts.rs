@@ -13,16 +13,15 @@ use crate::{
     rerrs::{ErrorKind, SteelErr},
     rvals::{ByteCodeLambda, Result, SteelVal},
     stop,
-    values::contracts::{ContractType, ContractedFunction, FlatContract, FunctionContract},
+    values::contracts::{
+        Contract, ContractType, ContractedFunction, DependentContract, FlatContract,
+        FunctionContract, FunctionKind,
+    },
 };
 
 use log::debug;
 
 use super::stack::Stack;
-
-// let vm_stack = Rc::new(RefCell::new(&mut self.stack));
-// let vm_stack_index = Rc::new(RefCell::new(&mut self.stack_index));
-// let function_stack = Rc::new(RefCell::new(&mut self.function_stack));
 
 /// Extension trait for the application of contracted functions
 pub(crate) trait ContractedFunctionExt {
@@ -154,6 +153,7 @@ impl FlatContractExt for FlatContract {
                     stack_index,
                     use_callbacks,
                     apply_contracts,
+                    None,
                 )
             }
             _ => stop!(TypeMismatch => "contract expected a function"; *cur_inst_span),
@@ -172,7 +172,8 @@ pub(crate) trait FunctionContractExt {
     fn apply<CT: ConstantTable, U: UseCallbacks, A: ApplyContracts>(
         &self,
         name: &Option<String>,
-        function: &ByteCodeLambda,
+        // function: &Gc<ByteCodeLambda>,
+        function: &SteelVal,
         arguments: &[SteelVal],
         constants: &CT,
         cur_inst_span: &Span,
@@ -187,11 +188,11 @@ pub(crate) trait FunctionContractExt {
     ) -> Result<SteelVal>;
 }
 
-impl FunctionContractExt for FunctionContract {
+impl FunctionContractExt for FunctionKind {
     fn apply<CT: ConstantTable, U: UseCallbacks, A: ApplyContracts>(
         &self,
         name: &Option<String>,
-        function: &ByteCodeLambda,
+        function: &SteelVal,
         arguments: &[SteelVal],
         constants: &CT,
         cur_inst_span: &Span,
@@ -204,17 +205,106 @@ impl FunctionContractExt for FunctionContract {
         use_callbacks: U,
         apply_contracts: A,
     ) -> Result<SteelVal> {
-        let mut verified_args = Vec::new();
+        match self {
+            Self::Basic(fc) => fc.apply(
+                name,
+                function,
+                arguments,
+                constants,
+                cur_inst_span,
+                callback,
+                upvalue_heap,
+                global_env,
+                stack,
+                function_stack,
+                stack_index,
+                use_callbacks,
+                apply_contracts,
+            ),
+            Self::Dependent(dc) => dc.apply(
+                name,
+                function,
+                arguments,
+                constants,
+                cur_inst_span,
+                callback,
+                upvalue_heap,
+                global_env,
+                stack,
+                function_stack,
+                stack_index,
+                use_callbacks,
+                apply_contracts,
+            ),
+        }
+    }
+}
 
-        for (i, (arg, contract)) in arguments
-            .iter()
-            .zip(self.pre_conditions().iter())
-            .enumerate()
+impl FunctionContractExt for DependentContract {
+    fn apply<CT: ConstantTable, U: UseCallbacks, A: ApplyContracts>(
+        &self,
+        name: &Option<String>,
+        function: &SteelVal,
+        arguments: &[SteelVal],
+        constants: &CT,
+        cur_inst_span: &Span,
+        callback: &EvaluationProgress,
+        upvalue_heap: &mut UpValueHeap,
+        global_env: &mut Env,
+        stack: &mut StackFrame,
+        function_stack: &mut Vec<Gc<ByteCodeLambda>>,
+        stack_index: &mut Stack<usize>,
+        use_callbacks: U,
+        apply_contracts: A,
+    ) -> Result<SteelVal> {
+        let mut verified_args: Vec<SteelVal> = Vec::new();
+
+        for (i, (arg, dependent_pair)) in
+            arguments.iter().zip(self.pre_conditions.iter()).enumerate()
         {
+            let thunk = &dependent_pair.thunk;
+
+            let arg_stack = dependent_pair
+                .arguments
+                .iter()
+                .map(|named_argument| {
+                    self.arg_positions
+                        .get(named_argument)
+                        .map(|x| arguments.get(*x))
+                        .flatten()
+                        .cloned()
+                })
+                .collect::<Option<Vec<SteelVal>>>()
+                .expect("missing argument in dependent contract");
+
+            let contract = {
+                function_stack.push(Gc::clone(thunk));
+                stack_index.push(stack.len());
+                for arg in arg_stack {
+                    stack.push(arg);
+                }
+
+                vm(
+                    thunk.body_exp(),
+                    stack, // TODO change this from verified args to the stack of arguments it needs
+                    global_env, // TODO remove this as well
+                    constants,
+                    callback,
+                    upvalue_heap,
+                    function_stack,
+                    stack_index,
+                    use_callbacks,
+                    apply_contracts,
+                    None,
+                )?
+                .contract_or_else(
+                    throw!(TypeMismatch => "dependent contract expected a contract"),
+                )?
+            };
+
             match contract.as_ref() {
                 ContractType::Flat(f) => {
                     debug!("applying flat contract in pre condition: {}", f.name);
-                    // unimplemented!();
 
                     if let Err(e) = f.apply(
                         arg.clone(),
@@ -234,7 +324,7 @@ impl FunctionContractExt for FunctionContract {
                             self.contract_attachment_location, name
                         );
 
-                        let message = format!("This function call caused an error - an occured in the domain position: {}, with the contract: {}, {}, blaming: {:?} (callsite)", i, self.to_string(), e.to_string(), self.contract_attachment_location);
+                        let message = format!("This function call caused an error - it occured in the domain position: {}, with the contract: {}, {}, blaming: {:?} (callsite)", i, self.to_string(), e.to_string(), self.contract_attachment_location);
 
                         stop!(ContractViolation => message; *cur_inst_span);
                     }
@@ -271,30 +361,305 @@ impl FunctionContractExt for FunctionContract {
                         verified_args.push(new_arg);
                     }
 
-                    // TODO fix name, don't pass in None
-                    SteelVal::Closure(c) => verified_args
-                        .push(ContractedFunction::new(fc.clone(), c.clone(), name.clone()).into()),
-                    _ => {
-                        stop!(ContractViolation => "contracts not yet supported with non user defined"; *cur_inst_span)
-                    }
+                    _ => verified_args.push(
+                        ContractedFunction::new(fc.clone(), arg.clone(), name.clone()).into(),
+                    ),
                 },
             }
         }
 
-        let output = {
+        let output = match function {
+            SteelVal::Closure(function) => {
+                function_stack.push(Gc::clone(function));
+
+                stack_index.push(stack.len());
+                for arg in verified_args {
+                    stack.push(arg);
+                }
+
+                vm(
+                    function.body_exp(),
+                    stack,
+                    global_env, // TODO remove this as well
+                    constants,
+                    callback,
+                    upvalue_heap,
+                    function_stack,
+                    stack_index,
+                    use_callbacks,
+                    apply_contracts,
+                    None,
+                )?
+            }
+            SteelVal::BoxedFunction(f) => {
+                f(&verified_args).map_err(|x| x.set_span(*cur_inst_span))?
+            }
+            SteelVal::FuncV(f) => f(&verified_args).map_err(|x| x.set_span(*cur_inst_span))?,
+            SteelVal::FutureFunc(f) => SteelVal::FutureV(Gc::new(
+                f(&verified_args).map_err(|x| x.set_span(*cur_inst_span))?,
+            )),
+            _ => {
+                todo!("Implement contract application for non bytecode values");
+            }
+        };
+
+        let thunk = &self.post_condition.thunk;
+
+        let arg_stack = self
+            .post_condition
+            .arguments
+            .iter()
+            .map(|named_argument| {
+                self.arg_positions
+                    .get(named_argument)
+                    .map(|x| arguments.get(*x))
+                    .flatten()
+                    .cloned()
+            })
+            .collect::<Option<Vec<SteelVal>>>()
+            .expect("missing argument in dependent contract");
+
+        let contract = {
+            function_stack.push(Gc::clone(thunk));
+
+            stack_index.push(stack.len());
+            for arg in arg_stack {
+                stack.push(arg);
+            }
+
             vm(
-                function.body_exp(),
-                &mut verified_args.into(),
+                thunk.body_exp(),
+                stack, // TODO change this from verified args to the stack of arguments it needs
                 global_env, // TODO remove this as well
                 constants,
                 callback,
                 upvalue_heap,
-                &mut Vec::new(),
-                &mut Stack::new(),
+                function_stack,
+                stack_index,
                 use_callbacks,
                 apply_contracts,
-            )
-        }?;
+                None,
+            )?
+            .contract_or_else(throw!(TypeMismatch => "dependent contract expected a contract"))?
+        };
+
+        match contract.as_ref() {
+            ContractType::Flat(f) => {
+                // unimplemented!();
+
+                debug!("applying flat contract in post condition: {}", f.name);
+
+                if let Err(e) = f.apply(
+                    output.clone(),
+                    constants,
+                    cur_inst_span,
+                    callback,
+                    upvalue_heap,
+                    global_env,
+                    stack,
+                    function_stack,
+                    stack_index,
+                    use_callbacks,
+                    apply_contracts,
+                ) {
+                    debug!(
+                        "Blame locations: {:?}, {:?}",
+                        self.contract_attachment_location, name
+                    );
+
+                    debug!("Parent exists: {}", self.parent().is_some());
+
+                    let blame_location = if self.contract_attachment_location.is_none() {
+                        name
+                    } else {
+                        &self.contract_attachment_location
+                    };
+
+                    // TODO clean this up
+                    if let Some(blame_location) = blame_location {
+                        let error_message = format!("this function call resulted in an error - occured in the range position of this contract: {} \n
+                        {}
+                        blaming: {} - broke its own contract", self.to_string(), e.to_string(), blame_location);
+
+                        stop!(ContractViolation => error_message; *cur_inst_span);
+                    } else {
+                        let error_message = format!("this function call resulted in an error - occured in the range position of this contract: {} \n
+                        {}
+                        blaming: None - broke its own contract", self.to_string(), e.to_string());
+
+                        stop!(ContractViolation => error_message; *cur_inst_span);
+                    }
+                }
+
+                Ok(output)
+            }
+            ContractType::Function(fc) => match output {
+                SteelVal::ContractedFunction(contracted_function) => {
+                    let mut pre_parent = contracted_function.contract.clone();
+                    pre_parent.set_attachment_location(contracted_function.name.clone());
+
+                    let parent = Gc::new(pre_parent);
+
+                    let func = contracted_function.function.clone();
+
+                    debug!(
+                        "Setting the parent: {} on a postcondition function: {}",
+                        parent.to_string(),
+                        fc.to_string()
+                    );
+
+                    // Get the contract down from the parent
+                    let mut fc = fc.clone();
+                    fc.set_parent(parent);
+                    debug!(
+                        "Inside: {:?}, Setting attachment location in range to: {:?}",
+                        name, contracted_function.name
+                    );
+
+                    // TODO Don't pass in None here
+                    let output = ContractedFunction::new(fc, func, name.clone()).into();
+
+                    Ok(output)
+                }
+
+                _ => Ok(ContractedFunction::new(fc.clone(), output, name.clone()).into()),
+            },
+        }
+    }
+}
+
+impl FunctionContractExt for FunctionContract {
+    fn apply<CT: ConstantTable, U: UseCallbacks, A: ApplyContracts>(
+        &self,
+        name: &Option<String>,
+        function: &SteelVal,
+        arguments: &[SteelVal],
+        constants: &CT,
+        cur_inst_span: &Span,
+        callback: &EvaluationProgress,
+        upvalue_heap: &mut UpValueHeap,
+        global_env: &mut Env,
+        stack: &mut StackFrame,
+        function_stack: &mut Vec<Gc<ByteCodeLambda>>,
+        stack_index: &mut Stack<usize>,
+        use_callbacks: U,
+        apply_contracts: A,
+    ) -> Result<SteelVal> {
+        let mut verified_args = Vec::new();
+
+        for (i, (arg, contract)) in arguments
+            .iter()
+            .zip(self.pre_conditions().iter())
+            .enumerate()
+        {
+            match contract.as_ref() {
+                ContractType::Flat(f) => {
+                    debug!("applying flat contract in pre condition: {}", f.name);
+
+                    if let Err(e) = f.apply(
+                        arg.clone(),
+                        constants,
+                        cur_inst_span,
+                        callback,
+                        upvalue_heap,
+                        global_env,
+                        stack,
+                        function_stack,
+                        stack_index,
+                        use_callbacks,
+                        apply_contracts,
+                    ) {
+                        debug!(
+                            "Blame locations: {:?}, {:?}",
+                            self.contract_attachment_location, name
+                        );
+
+                        let message = format!("This function call caused an error - it occured in the domain position: {}, with the contract: {}, {}, blaming: {:?} (callsite)", i, self.to_string(), e.to_string(), self.contract_attachment_location);
+
+                        stop!(ContractViolation => message; *cur_inst_span);
+                    }
+
+                    verified_args.push(arg.clone());
+                }
+                ContractType::Function(fc) => match arg {
+                    SteelVal::ContractedFunction(contracted_function) => {
+                        let mut pre_parent = contracted_function.contract.clone();
+                        pre_parent.set_attachment_location(contracted_function.name.clone());
+
+                        let parent = Gc::new(pre_parent);
+
+                        let func = contracted_function.function.clone();
+
+                        debug!(
+                            "Setting the parent: {} on a precondition function: {}",
+                            parent.to_string(),
+                            fc.to_string()
+                        );
+
+                        // Get the contract down from the
+                        let mut fc = fc.clone();
+                        fc.set_parent(parent);
+                        debug!(
+                            "Inside: {:?}, Setting attachment location in range to: {:?}",
+                            name, contracted_function.name
+                        );
+                        fc.set_attachment_location(contracted_function.name.clone());
+
+                        // TODO Don't pass in None
+                        let new_arg = ContractedFunction::new(fc, func, name.clone()).into();
+
+                        verified_args.push(new_arg);
+                    }
+
+                    _ => verified_args.push(
+                        ContractedFunction::new(fc.clone(), arg.clone(), name.clone()).into(),
+                    ),
+                },
+            }
+        }
+
+        // TODO use actual VM with real stack instead
+
+        let output = match function {
+            SteelVal::Closure(function) => {
+                function_stack.push(Gc::clone(function));
+
+                // Set the state prior to the recursive call
+                stack_index.push(stack.len());
+
+                for arg in verified_args {
+                    stack.push(arg);
+                }
+
+                // vm_stack_copy.borrow_mut().push(arg?);
+
+                // function_stack_copy.borrow_mut().push(Gc::clone(closure));
+
+                vm(
+                    function.body_exp(),
+                    stack,
+                    global_env, // TODO remove this as well
+                    constants,
+                    callback,
+                    upvalue_heap,
+                    function_stack,
+                    stack_index,
+                    use_callbacks,
+                    apply_contracts,
+                    None,
+                )?
+            }
+            SteelVal::BoxedFunction(f) => {
+                f(&verified_args).map_err(|x| x.set_span(*cur_inst_span))?
+            }
+            SteelVal::FuncV(f) => f(&verified_args).map_err(|x| x.set_span(*cur_inst_span))?,
+            SteelVal::FutureFunc(f) => SteelVal::FutureV(Gc::new(
+                f(&verified_args).map_err(|x| x.set_span(*cur_inst_span))?,
+            )),
+            _ => {
+                todo!("Implement contract application for non bytecode values");
+            }
+        };
 
         match self.post_condition().as_ref() {
             ContractType::Flat(f) => {
@@ -375,13 +740,7 @@ impl FunctionContractExt for FunctionContract {
                     Ok(output)
                 }
 
-                // TODO don't pass in None
-                SteelVal::Closure(c) => {
-                    Ok(ContractedFunction::new(fc.clone(), c, name.clone()).into())
-                }
-                _ => {
-                    stop!(ContractViolation => "contracts not yet supported with non user defined"; *cur_inst_span)
-                }
+                _ => Ok(ContractedFunction::new(fc.clone(), output, name.clone()).into()),
             },
         }
     }

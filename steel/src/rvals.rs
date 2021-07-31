@@ -1,6 +1,7 @@
 use crate::{
     core::instructions::DenseInstruction,
     gc::Gc,
+    jit::sig::JitFunctionPointer,
     rerrs::{ErrorKind, SteelErr},
     steel_vm::vm::Continuation,
     values::port::SteelPort,
@@ -32,6 +33,8 @@ use im_rc::{HashMap, HashSet, Vector};
 
 use futures::FutureExt;
 use futures::{future::Shared, task::noop_waker_ref};
+
+use std::cell::Cell;
 
 pub type RcRefSteelVal = Rc<RefCell<SteelVal>>;
 pub fn new_rc_ref_cell(x: SteelVal) -> RcRefSteelVal {
@@ -285,6 +288,8 @@ pub enum SteelVal {
     BoxedFunction(BoxedFunctionSignature),
     // Continuation
     ContinuationFunction(Gc<Continuation>),
+    // Function Pointer
+    CompiledFunction(JitFunctionPointer),
 }
 
 // pub trait Continuation: Clone {}
@@ -524,9 +529,39 @@ impl SteelVal {
         }
     }
 
+    pub fn contract_or_else<E, F: FnOnce() -> E>(
+        &self,
+        err: F,
+    ) -> std::result::Result<Gc<ContractType>, E> {
+        match self {
+            Self::Contract(c) => Ok(c.clone()),
+            _ => Err(err()),
+        }
+    }
+
+    pub fn closure_or_else<E, F: FnOnce() -> E>(
+        &self,
+        err: F,
+    ) -> std::result::Result<Gc<ByteCodeLambda>, E> {
+        match self {
+            Self::Closure(c) => Ok(c.clone()),
+            _ => Err(err()),
+        }
+    }
+
     pub fn symbol_or_else<E, F: FnOnce() -> E>(&self, err: F) -> std::result::Result<&str, E> {
         match self {
             Self::SymbolV(v) => Ok(&v),
+            _ => Err(err()),
+        }
+    }
+
+    pub fn clone_symbol_or_else<E, F: FnOnce() -> E>(
+        &self,
+        err: F,
+    ) -> std::result::Result<String, E> {
+        match self {
+            Self::SymbolV(v) => Ok(v.unwrap()),
             _ => Err(err()),
         }
     }
@@ -688,6 +723,8 @@ impl UpValue {
     // Given a reference to the stack, either get the value from the stack index
     // Or snag the steelval stored inside the upvalue
     pub(crate) fn get_value(&self, stack: &[SteelVal]) -> SteelVal {
+        // println!("Getting value from: {:?}", self.location);
+        // println!("Stack: {:?}", stack);
         match self.location {
             Location::Stack(idx) => stack[idx].clone(),
             Location::Closed(ref v) => v.clone(),
@@ -775,6 +812,8 @@ pub struct ByteCodeLambda {
     body_exp: Rc<[DenseInstruction]>,
     arity: usize,
     upvalues: Vec<Weak<RefCell<UpValue>>>,
+    call_count: Cell<usize>,
+    cant_be_compiled: Cell<bool>,
 }
 
 impl PartialEq for ByteCodeLambda {
@@ -800,6 +839,8 @@ impl ByteCodeLambda {
             body_exp: Rc::from(body_exp.into_boxed_slice()),
             arity,
             upvalues,
+            call_count: Cell::new(0),
+            cant_be_compiled: Cell::new(false),
         }
     }
 
@@ -825,6 +866,23 @@ impl ByteCodeLambda {
 
     pub fn upvalues(&self) -> &[Weak<RefCell<UpValue>>] {
         &self.upvalues
+    }
+
+    pub fn increment_call_count(&self) {
+        // self.call_count += 1;
+        self.call_count.set(self.call_count.get() + 1);
+    }
+
+    pub fn call_count(&self) -> usize {
+        self.call_count.get()
+    }
+
+    pub fn set_cannot_be_compiled(&self) {
+        self.cant_be_compiled.set(true)
+    }
+
+    pub fn has_attempted_to_be_compiled(&self) -> bool {
+        self.cant_be_compiled.get()
     }
 }
 
@@ -898,10 +956,11 @@ fn display_helper(val: &SteelVal, f: &mut fmt::Formatter) -> fmt::Result {
         // Promise(_) => write!(f, "#<promise>"),
         StreamV(_) => write!(f, "#<stream>"),
         BoxV(b) => write!(f, "#<box {:?}>", b.borrow()),
-        Contract(_) => write!(f, "#<contract>"),
+        Contract(c) => write!(f, "{}", c.to_string()),
         ContractedFunction(_) => write!(f, "#<contracted-function>"),
         BoxedFunction(_) => write!(f, "#<function>"),
         ContinuationFunction(_) => write!(f, "#<continuation>"),
+        CompiledFunction(_) => write!(f, "#<compiled-function>"),
     }
 }
 
