@@ -1,8 +1,5 @@
-#![allow(unused)]
-
-use crate::compiler::code_gen::fresh_function_id;
+// use crate::compiler::code_gen::fresh_function_id;
 use crate::compiler::compiler::Compiler;
-use crate::core::instructions::pretty_print_dense_instructions;
 use crate::core::instructions::u24;
 use crate::gc::shared::MutContainer;
 use crate::gc::shared::ShareableMut;
@@ -15,7 +12,6 @@ use crate::parser::parser::Sources;
 use crate::parser::replace_idents::expand_template;
 use crate::primitives::lists::car;
 use crate::primitives::lists::cdr;
-use crate::primitives::lists::cons;
 use crate::primitives::lists::is_empty;
 use crate::primitives::lists::new as new_list;
 use crate::primitives::lists::steel_cons;
@@ -23,14 +19,13 @@ use crate::primitives::numbers::add_two;
 use crate::rvals::as_underlying_type;
 use crate::rvals::cycles::BreadthFirstSearchSteelValVisitor;
 use crate::rvals::number_equality;
-use crate::rvals::AsRefMutSteelVal as _;
+// use crate::rvals::AsRefMutSteelVal as _;
 use crate::rvals::BoxedAsyncFunctionSignature;
 use crate::rvals::FromSteelVal as _;
 use crate::rvals::SteelString;
 use crate::steel_vm::primitives::steel_not;
 use crate::steel_vm::primitives::steel_set_box_mutable;
 use crate::steel_vm::primitives::steel_unbox_mutable;
-use crate::steel_vm::primitives::THREADING_MODULE;
 use crate::values::closed::Heap;
 use crate::values::closed::MarkAndSweepContext;
 use crate::values::functions::RootedInstructions;
@@ -40,7 +35,6 @@ use crate::values::transducers::Reducer;
 use crate::{
     compiler::constants::ConstantMap,
     core::{instructions::DenseInstruction, opcode::OpCode},
-    rvals::FutureResult,
 };
 use crate::{
     compiler::program::Executable,
@@ -58,27 +52,17 @@ use crate::{
     stop,
     values::functions::ByteCodeLambda,
 };
-use std::cell::UnsafeCell;
 use std::io::Read as _;
-use std::rc::Weak;
 use std::sync::atomic::AtomicBool;
-use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::thread::JoinHandle;
-use std::thread::ThreadId;
 use std::{cell::RefCell, collections::HashMap, iter::Iterator, rc::Rc};
 
-use super::builtin::DocTemplate;
-use super::builtin::MarkdownDoc;
 use super::engine::EngineId;
-
-use crate::values::lists::List;
 
 use crossbeam::atomic::AtomicCell;
 #[cfg(feature = "profiling")]
 use log::{debug, log_enabled};
-use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use smallvec::SmallVec;
 #[cfg(feature = "profiling")]
@@ -89,7 +73,7 @@ use threads::ThreadHandle;
 use crate::rvals::{from_serializable_value, into_serializable_value, IntoSteelVal};
 
 pub(crate) mod threads;
-pub(crate) use threads::{spawn_thread, thread_join};
+pub(crate) use threads::spawn_thread;
 
 pub use threads::{mutex_lock, mutex_unlock};
 
@@ -116,7 +100,7 @@ pub fn unlikely(b: bool) -> bool {
 const STACK_LIMIT: usize = 1000000;
 const _JIT_THRESHOLD: usize = 100;
 
-const USE_SUPER_INSTRUCTIONS: bool = false;
+const _USE_SUPER_INSTRUCTIONS: bool = false;
 const CHECK_STACK_OVERFLOW: bool = false;
 
 #[repr(C)]
@@ -346,38 +330,6 @@ thread_local! {
     pub(crate) static DEFAULT_CONSTANT_MAP: ConstantMap = ConstantMap::new();
 }
 
-// Incredibly unsafe, however I think it is what we're gonna
-// need in order to do this safepoint business.
-//
-// Once we're within a safe point, the thread _could_ be running
-// a native function. This is more or less the only time in which
-// we can take a peek at the contents of the thread.
-//
-// Note: we won't mutate, however it is almost assuredly, not safe.
-pub struct SafepointablePointer<T> {
-    within_safepoint: Arc<AtomicBool>,
-    paused: Arc<AtomicBool>,
-    value: Arc<UnsafeCell<T>>,
-}
-
-impl<T> SafepointablePointer<T> {
-    pub unsafe fn get_mut(&self) -> &mut T {
-        &mut *self.value.get()
-    }
-
-    pub unsafe fn get_safepoint_safe(&self) -> Option<&T> {
-        if self
-            .within_safepoint
-            .load(std::sync::atomic::Ordering::Relaxed)
-            && self.paused.load(std::sync::atomic::Ordering::Relaxed)
-        {
-            Some(&*self.value.get())
-        } else {
-            None
-        }
-    }
-}
-
 #[derive(Copy, Clone, Default)]
 pub enum ThreadState {
     #[default]
@@ -390,9 +342,16 @@ pub enum ThreadState {
 /// The thread execution context
 #[derive(Clone)]
 pub struct SteelThread {
+    // TODO: Figure out how to best broadcast changes
+    // to the rest of the world? Right now pausing threads
+    // means we can get away with one environment that is
+    // shared, but in reality this should just be
     pub(crate) global_env: Env,
     pub(crate) stack: Vec<SteelVal>,
+
+    #[cfg(feature = "dynamic")]
     profiler: OpCodeOccurenceProfiler,
+
     pub(crate) function_interner: FunctionInterner,
     pub(crate) heap: Arc<Mutex<Heap>>,
     pub(crate) runtime_options: RunTimeOptions,
@@ -427,15 +386,6 @@ impl RunTimeOptions {
         }
     }
 }
-
-// struct InstructionChunk {
-//     start: usize,
-//     end: usize,
-//     id: usize,
-// }
-
-#[derive(PartialEq)]
-struct SpanId(usize);
 
 // TODO: This object probably needs to be shared as well
 #[derive(Default, Clone)]
@@ -492,7 +442,7 @@ impl ThreadStateController {
 
 #[derive(Clone)]
 struct ThreadContext {
-    ctx: std::sync::Weak<AtomicCell<Option<*const SteelThread>>>,
+    ctx: std::sync::Weak<AtomicCell<Option<*mut SteelThread>>>,
     handle: SteelVal,
 }
 
@@ -508,7 +458,7 @@ pub struct Synchronizer {
 
     // If we're at a safe point, then this will include a _live_ pointer
     // to the context. Once we exit the safe point, we're done.
-    ctx: Arc<AtomicCell<Option<*const SteelThread>>>,
+    ctx: Arc<AtomicCell<Option<*mut SteelThread>>>,
 }
 
 // TODO: Until I figure out how to note have this be the case
@@ -527,13 +477,56 @@ impl Synchronizer {
         }
     }
 
+    pub(crate) unsafe fn call_per_ctx(&mut self, mut func: impl FnMut(&mut SteelThread)) {
+        let guard = self.threads.lock().unwrap();
+
+        // IMPORTANT - This needs to be all threads except the currently
+        // executing one.
+        for ThreadContext { ctx, .. } in guard.iter() {
+            if let Some(ctx) = ctx.upgrade() {
+                if Arc::ptr_eq(&ctx, &self.ctx) {
+                    continue;
+                }
+
+                // TODO: Have to use a condvar
+                loop {
+                    if let Some(ctx) = ctx.load() {
+                        log::debug!("Broadcasting `set!` operation");
+
+                        unsafe {
+                            let live_ctx = &mut (*ctx);
+                            (func)(live_ctx)
+                        }
+
+                        break;
+                    } else {
+                        log::debug!("Waiting for thread...")
+
+                        // println!("Waiting for thread...");
+
+                        // TODO: Some kind of condvar or message passing
+                        // is probably a better scheme here, but the idea is to just
+                        // wait until all the threads are done.
+                    }
+                }
+            } else {
+                continue;
+            }
+        }
+    }
+
     pub(crate) unsafe fn enumerate_stacks(&mut self, context: &mut MarkAndSweepContext) {
         // TODO: Continue...
-        let mut guard = self.threads.lock().unwrap();
+        let guard = self.threads.lock().unwrap();
 
         // Wait for all the threads to be legal
-        for ThreadContext { ctx, handle } in guard.iter() {
+        for ThreadContext { ctx, .. } in guard.iter() {
             if let Some(ctx) = ctx.upgrade() {
+                // Don't pause myself, enter safepoint from main thread?
+                if Arc::ptr_eq(&ctx, &self.ctx) {
+                    continue;
+                }
+
                 // TODO: Have to use a condvar
                 loop {
                     if let Some(ctx) = ctx.load() {
@@ -607,10 +600,23 @@ impl Synchronizer {
 
 impl SteelThread {
     pub fn new(sources: Sources, compiler: std::sync::Arc<RwLock<Compiler>>) -> SteelThread {
+        let synchronizer = Synchronizer::new();
+        let weak_ctx = Arc::downgrade(&synchronizer.ctx);
+
+        // TODO: Entering safepoint should happen often
+        // for the main thread?
+        synchronizer.threads.lock().unwrap().push(ThreadContext {
+            ctx: weak_ctx,
+            handle: SteelVal::Void,
+        });
+
         SteelThread {
             global_env: Env::root(),
             stack: Vec::with_capacity(128),
+
+            #[cfg(feature = "dynamic")]
             profiler: OpCodeOccurenceProfiler::new(),
+
             function_interner: FunctionInterner::default(),
             // _super_instructions: Vec::new(),
             heap: Arc::new(Mutex::new(Heap::new())),
@@ -624,7 +630,7 @@ impl SteelThread {
             // with the executables
             constant_map: DEFAULT_CONSTANT_MAP.with(|x| x.clone()),
             interrupted: Default::default(),
-            synchronizer: Synchronizer::new(),
+            synchronizer,
             thread_local_storage: Vec::new(),
             sources,
             compiler,
@@ -648,7 +654,8 @@ impl SteelThread {
         // thread exists
 
         if cfg!(feature = "sync") && self.safepoints_enabled {
-            self.synchronizer.ctx.store(Some(self as _));
+            let ptr = self as _;
+            self.synchronizer.ctx.store(Some(ptr));
         }
 
         let res = finish(self);
@@ -765,13 +772,16 @@ impl SteelThread {
 
             SteelVal::Closure(closure) => {
                 // Create phony span vec
-                let spans = closure.body_exp().iter().map(|_| Span::default()).collect();
+                let spans = closure
+                    .body_exp()
+                    .iter()
+                    .map(|_| Span::default())
+                    .collect::<Vec<_>>();
 
                 let mut vm_instance = VmCore::new_unchecked(
                     // Shared::new([]),
                     RootedInstructions::new(THE_EMPTY_INSTRUCTION_SET.with(|x| x.clone())),
                     constant_map,
-                    Shared::clone(&spans),
                     self,
                     &spans,
                 );
@@ -821,7 +831,6 @@ impl SteelThread {
                 let mut vm_instance = VmCore::new_unchecked(
                     RootedInstructions::new(THE_EMPTY_INSTRUCTION_SET.with(|x| x.clone())),
                     constant_map,
-                    Shared::new([]),
                     self,
                     &[],
                 );
@@ -830,12 +839,15 @@ impl SteelThread {
             }
             SteelVal::Closure(closure) => {
                 // TODO: Revisit if we need this phony span vec!
-                let spans = closure.body_exp().iter().map(|_| Span::default()).collect();
+                let spans = closure
+                    .body_exp()
+                    .iter()
+                    .map(|_| Span::default())
+                    .collect::<Vec<_>>();
 
                 let mut vm_instance = VmCore::new_unchecked(
                     RootedInstructions::new(THE_EMPTY_INSTRUCTION_SET.with(|x| x.clone())),
                     constant_map,
-                    Shared::clone(&spans),
                     self,
                     &spans,
                 );
@@ -848,46 +860,21 @@ impl SteelThread {
         }
     }
 
-    pub fn execute_eval(
-        &mut self,
-        instructions: Shared<[DenseInstruction]>,
-        constant_map: ConstantMap,
-        spans: Shared<[Span]>,
-    ) -> Result<SteelVal> {
-        todo!()
-
-        // let stack = std::mem::take(&mut self.stack);
-        // let frames = std::mem::take(&mut self.stack_frames);
-    }
-
     pub fn execute(
         &mut self,
         instructions: Shared<[DenseInstruction]>,
         constant_map: ConstantMap,
         spans: Shared<[Span]>,
     ) -> Result<SteelVal> {
+        #[cfg(feature = "dynamic")]
         self.profiler.reset();
 
         #[cfg(feature = "profiling")]
         let execution_time = Instant::now();
 
-        // let mut vm_instance = VmCore::new(
-        //     instructions,
-        //     constant_map,
-        //     Shared::clone(&spans),
-        //     self,
-        //     &spans,
-        // )?;
-
-        let keep_alive = instructions.clone();
-
-        // TODO: Very important! Convert this back before we return
-        let raw_keep_alive = Shared::into_raw(keep_alive);
-
         let mut vm_instance = VmCore::new(
             RootedInstructions::new(instructions),
             constant_map,
-            Shared::clone(&spans),
             self,
             &spans,
         )?;
@@ -895,7 +882,7 @@ impl SteelThread {
         // This is our pseudo "dynamic unwind"
         // If we need to, we'll walk back on the stack and find any handlers to pop
         'outer: loop {
-            let result = vm_instance.vm().map_err(|mut error| {
+            let result = vm_instance.vm().map_err(|error| {
                 error
                     .set_span_if_none(vm_instance.current_span())
                     .with_stack_trace(vm_instance.snapshot_stack_trace())
@@ -915,7 +902,7 @@ impl SteelThread {
                     if last
                         .attachments
                         .as_mut()
-                        .and_then(|mut x| x.weak_continuation_mark.take())
+                        .and_then(|x| x.weak_continuation_mark.take())
                         .is_some()
                     {
                         vm_instance.thread.stack.truncate(last.sp as _);
@@ -927,8 +914,7 @@ impl SteelThread {
                         vm_instance.close_continuation_marks(&last);
                     }
 
-                    if let Some(handler) =
-                        last.attachments.as_mut().and_then(|mut x| x.handler.take())
+                    if let Some(handler) = last.attachments.as_mut().and_then(|x| x.handler.take())
                     {
                         // Drop the stack BACK to where it was on this level
                         vm_instance.thread.stack.truncate(last.sp);
@@ -984,9 +970,6 @@ impl SteelThread {
                 }
 
                 self.stack.clear();
-                // self.current_frame = StackFrame::main();
-
-                unsafe { Shared::from_raw(raw_keep_alive) };
 
                 return Err(e);
             } else {
@@ -996,12 +979,6 @@ impl SteelThread {
 
                 // Clean up
                 self.stack.clear();
-
-                // self.current_frame = StackFrame::main();
-
-                // dbg!(&self.stack_frames);
-
-                unsafe { Shared::from_raw(raw_keep_alive) };
 
                 return result;
             }
@@ -1265,23 +1242,6 @@ pub struct ClosedContinuation {
 }
 
 pub trait VmContext {
-    // This allows for some funky self calling business
-    fn call_function_one_arg(&mut self, function: &SteelVal, arg: SteelVal) -> Result<SteelVal>;
-
-    // Call with two args
-    fn call_function_two_arg(
-        &mut self,
-        function: &SteelVal,
-        arg1: SteelVal,
-        arg2: SteelVal,
-    ) -> Result<SteelVal>;
-
-    fn call_function_many_args(
-        &mut self,
-        function: &SteelVal,
-        args: List<SteelVal>,
-    ) -> Result<SteelVal>;
-
     fn call_transduce(
         &mut self,
         ops: &[Transducers],
@@ -1301,46 +1261,6 @@ pub type BuiltInSignature =
     for<'a, 'b> fn(&'a mut VmCore<'b>, &[SteelVal]) -> Option<Result<SteelVal>>;
 
 impl<'a> VmContext for VmCore<'a> {
-    fn call_function_one_arg(&mut self, function: &SteelVal, arg: SteelVal) -> Result<SteelVal> {
-        let span = Span::default();
-        self.call_func_or_else(
-            function,
-            arg,
-            &span,
-            throw!(TypeMismatch => format!("application not a procedure: {function}")),
-        )
-    }
-
-    fn call_function_two_arg(
-        &mut self,
-        function: &SteelVal,
-        arg1: SteelVal,
-        arg2: SteelVal,
-    ) -> Result<SteelVal> {
-        let span = Span::default();
-        self.call_func_or_else_two_args(
-            function,
-            arg1,
-            arg2,
-            &span,
-            throw!(TypeMismatch => format!("application not a procedure: {function}")),
-        )
-    }
-
-    fn call_function_many_args(
-        &mut self,
-        function: &SteelVal,
-        args: List<SteelVal>,
-    ) -> Result<SteelVal> {
-        let span = Span::default();
-        self.call_func_or_else_many_args(
-            function,
-            args,
-            &span,
-            throw!(TypeMismatch => format!("application not a procedure: {function}")),
-        )
-    }
-
     fn call_transduce(
         &mut self,
         ops: &[Transducers],
@@ -1435,6 +1355,10 @@ impl<'a> VmContext for VmCore<'a> {
 pub struct VmCore<'a> {
     // pub(crate) instructions: Shared<[DenseInstruction]>,
     pub(crate) instructions: RootedInstructions,
+
+    // TODO: Replace this with a thread local constant map!
+    // that way reads are fast - and any updates to it are
+    // broadcast from the shared constant map.
     pub(crate) constants: ConstantMap,
     pub(crate) ip: usize,
     pub(crate) sp: usize,
@@ -1448,10 +1372,8 @@ pub struct VmCore<'a> {
 //
 impl<'a> VmCore<'a> {
     fn new_unchecked(
-        // instructions: Shared<[DenseInstruction]>,
         instructions: RootedInstructions,
         constants: ConstantMap,
-        spans: Shared<[Span]>,
         thread: &'a mut SteelThread,
         root_spans: &'a [Span],
     ) -> VmCore<'a> {
@@ -1468,10 +1390,8 @@ impl<'a> VmCore<'a> {
     }
 
     fn new(
-        // instructions: Shared<[DenseInstruction]>,
         instructions: RootedInstructions,
         constants: ConstantMap,
-        spans: Shared<[Span]>,
         thread: &'a mut SteelThread,
         root_spans: &'a [Span],
     ) -> Result<VmCore<'a>> {
@@ -1538,7 +1458,7 @@ impl<'a> VmCore<'a> {
     }
 
     #[inline(always)]
-    pub fn safepoint_or_interrupt(&self) -> Result<()> {
+    pub fn safepoint_or_interrupt(&mut self) -> Result<()> {
         // Check if we need to be paused
         if self
             .thread
@@ -1557,7 +1477,8 @@ impl<'a> VmCore<'a> {
                 ThreadState::PausedAtSafepoint => {
                     // TODO:
                     // Insert the code to do the stack things here
-                    self.thread.synchronizer.ctx.store(Some(self.thread as _));
+                    let ptr = self.thread as _;
+                    self.thread.synchronizer.ctx.store(Some(ptr));
                     self.park_thread_while_paused();
                     self.thread.synchronizer.ctx.store(None);
                 }
@@ -1607,7 +1528,7 @@ impl<'a> VmCore<'a> {
         )
     }
 
-    fn weak_collection(&mut self) {
+    pub fn weak_collection(&mut self) {
         self.thread.heap.lock().unwrap().weak_collection();
     }
 
@@ -1653,7 +1574,7 @@ impl<'a> VmCore<'a> {
     // how the existing call/cc implementation works already, which would be nice. However -
     // when _replaying_ the continuation, we should also assume that it can only be replayed
     // once to avoid copying the whole thing.
-    fn new_oneshot_continuation_from_state(&mut self) -> ClosedContinuation {
+    pub fn new_oneshot_continuation_from_state(&mut self) -> ClosedContinuation {
         ClosedContinuation {
             stack: std::mem::take(&mut self.thread.stack),
             instructions: self.instructions.clone(),
@@ -1774,9 +1695,7 @@ impl<'a> VmCore<'a> {
 
         self.depth += 1;
 
-        // println!("Before: {:?}", self.thread.stack_frames.len());
-
-        let mut res = Ok(SteelVal::Void);
+        let res;
 
         'outer: loop {
             let result = self
@@ -1799,7 +1718,7 @@ impl<'a> VmCore<'a> {
                     if last
                         .attachments
                         .as_mut()
-                        .and_then(|mut x| x.weak_continuation_mark.take())
+                        .and_then(|x| x.weak_continuation_mark.take())
                         .is_some()
                     {
                         self.thread.stack.truncate(last.sp);
@@ -1812,8 +1731,7 @@ impl<'a> VmCore<'a> {
                         self.close_continuation_marks(&last);
                     }
 
-                    if let Some(handler) =
-                        last.attachments.as_mut().and_then(|mut x| x.handler.take())
+                    if let Some(handler) = last.attachments.as_mut().and_then(|x| x.handler.take())
                     {
                         // Drop the stack BACK to where it was on this level
                         self.thread.stack.truncate(last.sp);
@@ -1993,8 +1911,6 @@ impl<'a> VmCore<'a> {
         cont: Continuation,
         args: impl IntoIterator<Item = SteelVal>,
     ) -> Result<SteelVal> {
-        let prev_length = self.thread.stack.len();
-
         for arg in args {
             self.thread.stack.push(arg);
         }
@@ -2178,7 +2094,7 @@ impl<'a> VmCore<'a> {
                     self.thread.stack[read_local.payload_size.to_usize() + offset].clone();
 
                 // get the const
-                let const_val = self.constants.get(push_const.payload_size.to_usize());
+                let const_val = self.constants.get_value(push_const.payload_size.to_usize());
 
                 let result = match $name(&[local_value, const_val]) {
                     Ok(value) => value,
@@ -2662,7 +2578,7 @@ impl<'a> VmCore<'a> {
                     payload_size,
                     ..
                 } => {
-                    let val = self.constants.get(payload_size.to_usize());
+                    let val = self.constants.get_value(payload_size.to_usize());
                     self.thread.stack.push(val);
                     self.ip += 1;
                 }
@@ -2880,8 +2796,6 @@ impl<'a> VmCore<'a> {
                     // panic!("Stopping");
 
                     self.ip = 0;
-
-                    let mut closure_arity = last_stack_frame.function.arity();
 
                     // TODO: Adjust the stack for multiple arity functions
                     let is_multi_arity = last_stack_frame.function.is_multi_arity;
@@ -3117,11 +3031,8 @@ impl<'a> VmCore<'a> {
     // if the last function was called in tail position.
     fn enclosing_span(&self) -> Option<Span> {
         if self.thread.stack_frames.len() > 1 {
-            let back_two = self.thread.stack_frames.len() - 2;
-
             if let [second, last] = &self.thread.stack_frames[self.thread.stack_frames.len() - 2..]
             {
-                let id = second.function.id;
                 let spans = self.thread.function_interner.spans.get(&second.function.id);
 
                 spans
@@ -3220,13 +3131,6 @@ impl<'a> VmCore<'a> {
     }
 
     #[inline(always)]
-    fn update_state_with_frame(&mut self, last: StackFrame) {
-        self.ip = last.ip;
-        self.instructions = last.instructions;
-        // self.spans = last.spans;
-    }
-
-    #[inline(always)]
     fn get_last_stack_frame_sp(&self) -> usize {
         self.thread.stack_frames.last().map(|x| x.sp).unwrap_or(0)
     }
@@ -3245,10 +3149,28 @@ impl<'a> VmCore<'a> {
     fn handle_set(&mut self, index: usize) -> Result<()> {
         let value_to_assign = self.thread.stack.pop().unwrap();
 
+        // STOP THREADS -> apply the set index across all of them.
+        // set! is _much_ slower than it needs to be.
+        self.thread.synchronizer.stop_threads();
+
         let value = self
             .thread
             .global_env
-            .repl_set_idx(index, value_to_assign)?;
+            .repl_set_idx(index, value_to_assign.clone())?;
+
+        // Updating on all
+        unsafe {
+            self.thread.synchronizer.call_per_ctx(|thread| {
+                thread
+                    .global_env
+                    .repl_set_idx(index, value_to_assign.clone())
+                    .unwrap();
+            });
+        }
+
+        // Resume.
+        // Apply these to all of the things.
+        self.thread.synchronizer.resume_threads();
 
         self.thread.stack.push(value);
         self.ip += 1;
@@ -3622,9 +3544,6 @@ impl<'a> VmCore<'a> {
         // So, this should probably do something like this:
 
         if let Some(guard) = self.thread.stack_frames.last() {
-            let guard = self.thread.stack_frames.last().unwrap();
-            // let stack_index = self.stack_index.last().copied().unwrap_or(0);
-            // let stack_index = self.stack_frames.last().map(|x| x.index).unwrap_or(0);
             let stack_index = self.get_offset();
 
             for _ in 0..ndefs {
@@ -3794,19 +3713,32 @@ impl<'a> VmCore<'a> {
         Ok(())
     }
 
-    // Enter a new thread, passing values that can be serialized
-    // Resolve all references, attempt to instantiate a new engine on the other side?
-    fn new_thread(&mut self, function: Gc<ByteCodeLambda>) {
-        todo!()
-
-        // Analyze the dependencies of the function, and see if its safe to be spawned on another thread
-    }
-
     // #[inline(always)]
     fn handle_bind(&mut self, payload_size: usize) {
+        let value = self.thread.stack.pop().unwrap();
+
+        // TODO: Do the same thing here:
+        self.thread.synchronizer.stop_threads();
+
+        // println!("Pausing threads to define new variable");
         self.thread
             .global_env
-            .repl_define_idx(payload_size, self.thread.stack.pop().unwrap());
+            .repl_define_idx(payload_size, value.clone());
+
+        // Updating on all
+        unsafe {
+            self.thread.synchronizer.call_per_ctx(|thread| {
+                thread
+                    .global_env
+                    .repl_define_idx(payload_size, value.clone());
+            });
+        }
+
+        // println!("Finished broadcasting new variable");
+
+        // Resume.
+        // Apply these to all of the things.
+        self.thread.synchronizer.resume_threads();
 
         self.ip += 1;
     }
@@ -3869,57 +3801,6 @@ impl<'a> VmCore<'a> {
         last.set_function(closure);
 
         self.ip = 0;
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn adjust_stack_for_multi_arity_tco(
-        &mut self,
-        is_multi_arity: bool,
-        original_arity: usize,
-        payload_size: usize,
-        new_arity: &mut usize,
-    ) -> Result<()> {
-        if likely(!is_multi_arity) {
-            if unlikely(original_arity != payload_size) {
-                stop!(ArityMismatch => format!("function expected {} arguments, found {}", original_arity, payload_size); self.current_span());
-            }
-        } else {
-            // println!(
-            //     "multi closure function, multi arity, arity: {:?}",
-            //     closure.arity()
-            // );
-
-            if payload_size < original_arity - 1 {
-                stop!(ArityMismatch => format!("function expected at least {} arguments, found {}", original_arity, payload_size); self.current_span());
-            }
-
-            // (define (test x . y))
-            // (test 1 2 3 4 5)
-            // in this case, arity = 2 and payload size = 5
-            // pop off the last 4, collect into a list
-            let amount_to_remove = 1 + payload_size - original_arity;
-
-            let values = self
-                .thread
-                .stack
-                .drain(self.thread.stack.len() - amount_to_remove..)
-                .collect();
-            // .split_off(self.thread.stack.len() - amount_to_remove);
-
-            let list = SteelVal::ListV(values);
-
-            self.thread.stack.push(list);
-
-            *new_arity = original_arity;
-
-            // println!("Stack after list conversion: {:?}", self.stack);
-        }
-
-        // else if closure.arity() != payload_size {
-        //     stop!(ArityMismatch => format!("function expected {} arguments, found {}", closure.arity(), payload_size); self.current_span());
-        // }
-
         Ok(())
     }
 
@@ -4139,37 +4020,6 @@ impl<'a> VmCore<'a> {
         Ok(())
     }
 
-    fn call_future_func_on_stack(
-        &mut self,
-        func: Rc<dyn Fn(&[SteelVal]) -> Result<FutureResult>>,
-        payload_size: usize,
-    ) -> Result<()> {
-        // stack is [args ... function]
-        let len = self.thread.stack.len();
-        // This is the start of the arguments
-        let last_index = len - payload_size - 1;
-
-        // Peek the range for the [args ... function]
-        //                        ~~~~~~~~~~
-        // let result = func(self.stack.peek_range_double(last_index..len))
-        //     .map_err(|x| x.set_span_if_none(self.current_span()))?;
-
-        let result = match func(&self.thread.stack[last_index..len]) {
-            Ok(value) => value,
-            Err(e) => return Err(e.set_span_if_none(self.current_span())),
-        };
-
-        // This is the old way, but now given that the function is included on the stack, this should work...
-        // self.stack.truncate(last_index);
-        // self.stack.push(result);
-
-        self.thread.stack.truncate(last_index + 1);
-        *self.thread.stack.last_mut().unwrap() = SteelVal::FutureV(Gc::new(result));
-
-        self.ip += 1;
-        Ok(())
-    }
-
     // #[inline(always)]
     fn call_future_func(
         &mut self,
@@ -4218,74 +4068,6 @@ impl<'a> VmCore<'a> {
         Ok(())
     }
 
-    // #[inline(always)]
-    fn handle_lazy_closure(
-        &mut self,
-        closure: &Gc<ByteCodeLambda>,
-        local: SteelVal,
-        const_value: SteelVal,
-    ) -> Result<()> {
-        self.cut_sequence();
-
-        let prev_length = self.thread.stack.len();
-
-        // push them onto the stack if we need to
-        self.thread.stack.push(local);
-        self.thread.stack.push(const_value);
-
-        // Push new stack frame
-        self.thread.stack_frames.push(
-            StackFrame::new(
-                prev_length,
-                Gc::clone(closure),
-                self.ip + 4,
-                // Shared::clone(&self.instructions),
-                self.instructions.clone(),
-                // Rc::clone(&self.spans),
-            ), // .with_span(self.current_span()),
-        );
-
-        // self.current_frame.sp = prev_length;
-
-        // self.current_frame.ip += 4;
-
-        // // Set the sp to be the current values on this
-        // let mut current_frame = StackFrame::new(
-        //     prev_length,
-        //     Gc::clone(closure),
-        //     self.ip + 4,
-        //     Rc::clone(&self.instructions),
-        // )
-        // .with_span(self.current_span());
-
-        // std::mem::swap(&mut current_frame, &mut self.current_frame);
-        // self.stack_frames.push(current_frame);
-
-        self.sp = prev_length;
-
-        // Push on the function stack so we have access to it later
-        // self.function_stack
-        //     .push(CallContext::new(Gc::clone(closure)).with_span(self.current_span()));
-
-        if closure.is_multi_arity {
-            panic!("Calling lazy closure with multi arity");
-        }
-
-        if closure.arity() != 2 {
-            stop!(ArityMismatch => format!("function expected {} arguments, found {}", closure.arity(), 2); self.current_span());
-        }
-
-        // self.current_arity = Some(closure.arity());
-
-        self.check_stack_overflow()?;
-        self.pop_count += 1;
-
-        self.instructions = closure.body_exp();
-        // self.spans = closure.spans();
-        self.ip = 0;
-        Ok(())
-    }
-
     #[inline(always)]
     fn check_stack_overflow(&self) -> Result<()> {
         if CHECK_STACK_OVERFLOW {
@@ -4305,97 +4087,6 @@ impl<'a> VmCore<'a> {
         // self.stack_frames.last().map(|x| x.index).unwrap_or(0)
     }
 
-    // #[inline(always)]
-    fn handle_lazy_function_call(
-        &mut self,
-        stack_func: SteelVal,
-        local: SteelVal,
-        const_value: SteelVal,
-    ) -> Result<()> {
-        use SteelVal::*;
-
-        match &stack_func {
-            BoxedFunction(f) => {
-                self.thread.stack.push(
-                    f.func()(&[local, const_value])
-                        .map_err(|x| x.set_span_if_none(self.current_span()))?,
-                );
-                self.ip += 4;
-            }
-            FuncV(f) => {
-                // self.stack
-                //     .push(f(&[local, const_value]).map_err(|x| x.set_span_if_none(self.current_span()))?);
-                // self.ip += 4;
-
-                match f(&[local, const_value]) {
-                    Ok(value) => self.thread.stack.push(value),
-                    Err(e) => return Err(e.set_span_if_none(self.current_span())),
-                }
-
-                // self.stack
-                // .push(f(&[local, const_value]).map_err(|x| x.set_span_if_none(self.current_span()))?);
-                self.ip += 4;
-            }
-            FutureFunc(f) => {
-                let result = SteelVal::FutureV(Gc::new(
-                    f(&[local, const_value])
-                        .map_err(|x| x.set_span_if_none(self.current_span()))?,
-                ));
-
-                self.thread.stack.push(result);
-                self.ip += 4;
-            }
-            // ContractedFunction(cf) => {
-            //     if let Some(arity) = cf.arity() {
-            //         if arity != 2 {
-            //             stop!(ArityMismatch => format!("function expected {} arguments, found {}", arity, 2); self.current_span());
-            //         }
-            //     }
-
-            //     // if A::enforce_contracts() {
-            //     let result = cf.apply(vec![local, const_value], &self.current_span(), self)?;
-
-            //     self.thread.stack.push(result);
-            //     self.ip += 4;
-            //     // } else {
-            //     // self.handle_lazy_function_call(cf.function.clone(), local, const_value)?;
-            //     // }
-            // }
-            // Contract(c) => self.call_contract(c, payload_size, span)?,
-            ContinuationFunction(_cc) => {
-                unimplemented!("calling continuation lazily not yet handled");
-            }
-            Closure(closure) => self.handle_lazy_closure(closure, local, const_value)?,
-            MutFunc(func) => {
-                let mut args = [local, const_value];
-                self.thread
-                    .stack
-                    .push(func(&mut args).map_err(|x| x.set_span_if_none(self.current_span()))?);
-
-                self.ip += 4;
-            }
-            CustomStruct(s) => {
-                if let Some(proc) = s.maybe_proc() {
-                    return self.handle_lazy_function_call(proc.clone(), local, const_value);
-                } else {
-                    stop!(Generic => "attempted to call struct as function, but the struct does not have a function to call!")
-                }
-            }
-            // BuiltIn(func) => {
-            //     let args = [local, const_value];
-            //     let result =
-            //         func(self, &args).map_err(|x| x.set_span_if_none(self.current_span()))?;
-            //     self.stack.push(result);
-            //     self.ip += 4;
-            // }
-            _ => {
-                log::error!("{stack_func:?}");
-                stop!(BadSyntax => format!("Function application not a procedure or function type not supported, {stack_func}"); self.current_span());
-            }
-        }
-        Ok(())
-    }
-
     // // #[inline(always)]
     pub(crate) fn handle_function_call_closure(
         &mut self,
@@ -4413,13 +4104,12 @@ impl<'a> VmCore<'a> {
 
         self.sp = self.thread.stack.len() - closure.arity();
 
-        let mut instructions = closure.body_exp();
+        let instructions = closure.body_exp();
 
         self.thread.stack_frames.push(StackFrame::new(
             self.sp,
             closure,
             self.ip + 1,
-            // Rc::clone(&self.instructions),
             std::mem::replace(&mut self.instructions, instructions),
         ));
 
@@ -4513,135 +4203,6 @@ impl<'a> VmCore<'a> {
         }
     }
 
-    #[inline(always)]
-    fn handle_global_function_call_by_ref(
-        &mut self,
-        stack_func: &SteelVal,
-        payload_size: usize,
-    ) -> Result<()> {
-        use SteelVal::*;
-
-        match stack_func {
-            Closure(closure) => {
-                self.handle_function_call_closure_jit(closure.clone(), payload_size)
-            }
-            FuncV(f) => self.call_primitive_func(*f, payload_size),
-            BoxedFunction(f) => self.call_boxed_func(f.func(), payload_size),
-            MutFunc(f) => self.call_primitive_mut_func(*f, payload_size),
-            FutureFunc(f) => self.call_future_func(f.clone(), payload_size),
-            ContinuationFunction(cc) => self.call_continuation(cc.clone()),
-            BuiltIn(f) => {
-                // self.ip -= 1;
-                self.call_builtin_func(*f, payload_size)
-            }
-            CustomStruct(s) => self.call_custom_struct(&s, payload_size),
-            _ => {
-                // Explicitly mark this as unlikely
-                cold();
-                log::error!("{stack_func:?}");
-                log::error!("Stack: {:?}", self.thread.stack);
-                stop!(BadSyntax => format!("Function application not a procedure or function type not supported: {}", stack_func); self.current_span());
-            }
-        }
-    }
-    #[inline(always)]
-    fn handle_non_instr_global_function_call(
-        &mut self,
-        stack_func: SteelVal,
-        args: &mut [SteelVal],
-    ) -> Result<Option<SteelVal>> {
-        use SteelVal::*;
-
-        self.ip += 1;
-
-        match stack_func {
-            BoxedFunction(f) => f.func()(args).map(Some),
-            MutFunc(f) => f(args).map(Some),
-            FuncV(f) => f(args).map(Some),
-            FutureFunc(f) => Ok(SteelVal::FutureV(Gc::new(f(args)?))).map(Some),
-            Closure(closure) => {
-                let arity = args.len();
-
-                for arg in args {
-                    self.thread
-                        .stack
-                        .push(std::mem::replace(arg, SteelVal::Void));
-                }
-
-                self.handle_function_call_closure_jit(closure, arity)
-                    .map(|_| None)
-            }
-            // TODO: Implement this for other functions
-            _ => {
-                log::error!("{stack_func:?}");
-                log::error!("Stack: {:?}", self.thread.stack);
-                stop!(BadSyntax => format!("Function application not a procedure or function type not supported: {stack_func}"); self.current_span());
-            }
-        }
-
-        // Ok(())
-    }
-
-    // #[inline(always)]
-    // fn handle_non_instr_global_function_call_lazy_push(
-    //     &mut self,
-    //     stack_func: SteelVal,
-    //     args: &mut [SteelVal],
-    // ) -> Result<()> {
-    //     use SteelVal::*;
-
-    //     // self.ip += 1;
-
-    //     match stack_func {
-    //         BoxedFunction(f) => {
-    //             self.ip += 1;
-    //             self.thread.stack.push(f.func()(args)?)
-    //         }
-    //         MutFunc(f) => {
-    //             self.ip += 1;
-    //             self.thread.stack.push(f(args)?)
-    //         }
-    //         FuncV(f) => {
-    //             self.ip += 1;
-    //             self.thread.stack.push(f(args)?)
-    //         }
-    //         FutureFunc(f) => {
-    //             self.ip += 1;
-    //             self.thread.stack.push(SteelVal::FutureV(Gc::new(f(args)?)))
-    //         }
-    //         Closure(closure) => {
-    //             let arity = args.len();
-
-    //             self.thread.stack.reserve(arity);
-
-    //             for arg in args {
-    //                 self.thread.stack.push(arg.clone());
-    //             }
-
-    //             // If we're here, we're already done profiling, and don't need to profile anymore
-    //             self.handle_function_call_closure_jit(closure, arity)?;
-    //         }
-    //         // BuiltIn(f) => f(self, args),
-    //         _ => {
-    //             log::error!("Lazy push: {stack_func:?}");
-    //             log::error!("Stack: {:?}", self.thread.stack);
-    //             stop!(BadSyntax => format!("Function application not a procedure or function type not supported: {stack_func}"); self.current_span());
-    //         }
-    //     }
-
-    //     Ok(())
-    // }
-
-    // #[inline(always)]
-    // fn call_contract(&mut self, contract: &Gc<ContractType>, payload_size: usize) -> Result<()> {
-    //     match contract.as_ref() {
-    //         ContractType::Flat(f) => self.handle_function_call(f.predicate.clone(), payload_size),
-    //         _ => {
-    //             stop!(BadSyntax => "Function application not a procedure - cannot apply function contract to argument");
-    //         }
-    //     }
-    // }
-
     // #[inline(always)]
     fn handle_function_call(&mut self, stack_func: SteelVal, payload_size: usize) -> Result<()> {
         use SteelVal::*;
@@ -4671,17 +4232,6 @@ impl<'a> VmCore<'a> {
 
 // TODO: This is gonna cause issues assuming this was called in tail call.
 pub fn current_function_span(ctx: &mut VmCore, args: &[SteelVal]) -> Option<Result<SteelVal>> {
-    if !args.is_empty() {
-        builtin_stop!(ArityMismatch => format!("current-function-span requires no arguments, found {}", args.len()))
-    }
-
-    match ctx.enclosing_span() {
-        Some(s) => Some(Span::into_steelval(s)),
-        None => Some(Ok(SteelVal::Void)),
-    }
-}
-
-pub fn caller_span(ctx: &mut VmCore, args: &[SteelVal]) -> Option<Result<SteelVal>> {
     if !args.is_empty() {
         builtin_stop!(ArityMismatch => format!("current-function-span requires no arguments, found {}", args.len()))
     }
@@ -4769,7 +4319,7 @@ pub fn inspect(ctx: &mut VmCore, args: &[SteelVal]) -> Option<Result<SteelVal>> 
 
 /// Inspect the locals at the given function. Probably need to provide a way to
 /// loop this back into the sources, in order to resolve any span information.
-pub fn breakpoint(ctx: &mut VmCore, args: &[SteelVal]) -> Option<Result<SteelVal>> {
+pub fn breakpoint(ctx: &mut VmCore, _args: &[SteelVal]) -> Option<Result<SteelVal>> {
     let offset = ctx.get_offset();
 
     // Wait for user input to continue...
@@ -4898,10 +4448,6 @@ pub fn call_with_exception_handler(
     None
 }
 
-pub fn oneshot_call_cc(ctx: &mut VmCore, args: &[SteelVal]) -> Option<Result<SteelVal>> {
-    todo!("Create continuation that can only be used once!")
-}
-
 #[steel_derive::context(name = "call/cc", arity = "Exact(1)")]
 pub fn call_cc(ctx: &mut VmCore, args: &[SteelVal]) -> Option<Result<SteelVal>> {
     /*
@@ -5019,12 +4565,9 @@ fn eval_program(program: crate::compiler::program::Executable, ctx: &mut VmCore)
     );
 
     let Executable {
-        name,
-        version,
-        time_stamp,
         instructions,
-        constant_map,
         spans,
+        ..
     } = program;
     let mut bytecode = Vec::new();
     let mut new_spans = Vec::new();
@@ -5111,7 +4654,7 @@ fn eval_program(program: crate::compiler::program::Executable, ctx: &mut VmCore)
 fn emit_expanded_file(path: String) {
     let mut engine = crate::steel_vm::engine::Engine::new();
 
-    let mut contents = std::fs::read_to_string(&path).unwrap();
+    let contents = std::fs::read_to_string(&path).unwrap();
 
     engine.expand_to_file(contents, std::path::PathBuf::from(path))
 }
@@ -5189,7 +4732,6 @@ fn eval_file_impl(ctx: &mut crate::steel_vm::vm::VmCore, args: &[SteelVal]) -> R
 
     match res {
         Ok(program) => {
-            let symbol_map_offset = ctx.thread.compiler.read().symbol_map.len();
             let result = program.build(
                 "eval-context".to_string(),
                 &mut ctx.thread.compiler.write().symbol_map,
@@ -5216,7 +4758,6 @@ fn eval_string_impl(ctx: &mut crate::steel_vm::vm::VmCore, args: &[SteelVal]) ->
 
     match res {
         Ok(program) => {
-            let symbol_map_offset = ctx.thread.compiler.read().symbol_map.len();
             let result = program.build(
                 "eval-context".to_string(),
                 &mut ctx.thread.compiler.write().symbol_map,
@@ -5258,7 +4799,7 @@ pub(crate) fn list_modules(ctx: &mut VmCore, _args: &[SteelVal]) -> Option<Resul
     Some(Ok(SteelVal::ListV(modules)))
 }
 
-pub(crate) fn environment_offset(ctx: &mut VmCore, args: &[SteelVal]) -> Option<Result<SteelVal>> {
+pub(crate) fn environment_offset(ctx: &mut VmCore, _args: &[SteelVal]) -> Option<Result<SteelVal>> {
     Some(Ok(ctx.thread.global_env.len().into_steelval().unwrap()))
 }
 
@@ -5266,7 +4807,7 @@ pub(crate) fn environment_offset(ctx: &mut VmCore, args: &[SteelVal]) -> Option<
 // Snag values, then expand them, then convert back? The constant conversion
 // back and forth will probably hamper performance significantly. That being said,
 // it is entirely at compile time, so probably _okay_
-pub(crate) fn expand_syntax_case_impl(ctx: &mut VmCore, args: &[SteelVal]) -> Result<SteelVal> {
+pub(crate) fn expand_syntax_case_impl(_ctx: &mut VmCore, args: &[SteelVal]) -> Result<SteelVal> {
     if args.len() != 3 {
         stop!(ArityMismatch => format!("#%expand-template expected 3 arguments, found: {}", args.len()))
     }
@@ -5274,7 +4815,7 @@ pub(crate) fn expand_syntax_case_impl(ctx: &mut VmCore, args: &[SteelVal]) -> Re
     let mut bindings: fxhash::FxHashMap<_, _> = if let SteelVal::HashMapV(h) = &args[1] {
         h.iter()
             .map(|(k, v)| match (k, v) {
-                (SteelVal::SymbolV(k), e) => Ok((
+                (SteelVal::SymbolV(k), _e) => Ok((
                     InternedString::from_str(k.as_str()),
                     crate::parser::ast::TryFromSteelValVisitorForExprKind::root(v)?,
                 )),
@@ -5309,7 +4850,7 @@ pub(crate) fn expand_syntax_case_impl(ctx: &mut VmCore, args: &[SteelVal]) -> Re
 
     let mut template = crate::parser::ast::TryFromSteelValVisitorForExprKind::root(&args[0])?;
 
-    expand_template(&mut template, &mut bindings, &mut binding_kind);
+    expand_template(&mut template, &mut bindings, &mut binding_kind)?;
 
     crate::parser::tryfrom_visitor::SyntaxObjectFromExprKind::try_from_expr_kind(template)
 }
@@ -5471,7 +5012,7 @@ pub(crate) fn apply(ctx: &mut VmCore, args: &[SteelVal]) -> Option<Result<SteelV
                     Some(result)
                 }
                 SteelVal::BoxedFunction(f) => {
-                    let mut args = l.into_iter().cloned().collect::<Vec<_>>();
+                    let args = l.into_iter().cloned().collect::<Vec<_>>();
 
                     let result =
                         f.func()(&args).map_err(|e| e.set_span_if_none(ctx.current_span()));
@@ -5536,6 +5077,7 @@ pub struct InstructionPattern {
     pub(crate) pattern: BlockPattern,
 }
 
+#[cfg(feature = "dynamic")]
 impl InstructionPattern {
     pub fn new(block: Rc<[(OpCode, usize)]>, pattern: BlockPattern) -> Self {
         Self { block, pattern }
@@ -5555,6 +5097,7 @@ pub struct BlockMetadata {
     created: bool,
 }
 
+#[cfg(feature = "dynamic")]
 #[derive(Clone)]
 pub struct OpCodeOccurenceProfiler {
     occurrences: HashMap<(OpCode, usize), usize>,
@@ -5564,6 +5107,7 @@ pub struct OpCodeOccurenceProfiler {
     sample_count: usize,
 }
 
+#[cfg(feature = "dynamic")]
 impl OpCodeOccurenceProfiler {
     pub fn new() -> Self {
         OpCodeOccurenceProfiler {
@@ -6244,6 +5788,7 @@ fn local_handler3(ctx: &mut VmCore<'_>) -> Result<()> {
     ctx.handle_local(3)
 }
 
+#[cfg(feature = "dynamic")]
 // OpCode::SETLOCAL
 fn set_local_handler(ctx: &mut VmCore<'_>) -> Result<()> {
     let offset = ctx.instructions[ctx.ip].payload_size;
@@ -6251,12 +5796,14 @@ fn set_local_handler(ctx: &mut VmCore<'_>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "dynamic")]
 // OpCode::SETLOCAL
 fn set_local_handler_with_payload(ctx: &mut VmCore<'_>, payload: usize) -> Result<()> {
     ctx.handle_set_local(payload);
     Ok(())
 }
 
+#[cfg(feature = "dynamic")]
 // OpCode::CALLGLOBAL
 fn call_global_handler(ctx: &mut VmCore<'_>) -> Result<()> {
     // assert!(ctx.ip + 1 < ctx.instructions.len());
@@ -6267,6 +5814,7 @@ fn call_global_handler(ctx: &mut VmCore<'_>) -> Result<()> {
     ctx.handle_call_global(payload_size.to_usize(), next_inst.payload_size.to_usize())
 }
 
+#[cfg(feature = "dynamic")]
 // OpCode::CALLGLOBAL
 // TODO: Fix this!
 fn call_global_handler_with_payload(ctx: &mut VmCore<'_>, payload: usize) -> Result<()> {
@@ -6275,28 +5823,26 @@ fn call_global_handler_with_payload(ctx: &mut VmCore<'_>, payload: usize) -> Res
     ctx.handle_call_global(payload, next_inst.payload_size.to_usize())
 }
 
-// TODO: Have a way to know the correct arity?
-fn call_global_handler_no_stack(
-    ctx: &mut VmCore<'_>,
-    args: &mut [SteelVal],
-) -> Result<Option<SteelVal>> {
-    // ctx.ip += 1;
-    let payload_size = ctx.instructions[ctx.ip].payload_size;
-    ctx.ip += 1;
+// // TODO: Have a way to know the correct arity?
+// fn call_global_handler_no_stack(
+//     ctx: &mut VmCore<'_>,
+//     args: &mut [SteelVal],
+// ) -> Result<Option<SteelVal>> {
+//     // ctx.ip += 1;
+//     let payload_size = ctx.instructions[ctx.ip].payload_size;
+//     ctx.ip += 1;
+//     // TODO: Track the op codes of the surrounding values as well
+//     // let next_inst = ctx.instructions[ctx.ip];
+//     // println!("Looking up a function at index: {}", payload_size.to_usize());
+//     let func = ctx
+//         .thread
+//         .global_env
+//         .repl_lookup_idx(payload_size.to_usize());
+//     ctx.handle_non_instr_global_function_call(func, args)
+// }
 
-    // TODO: Track the op codes of the surrounding values as well
-    // let next_inst = ctx.instructions[ctx.ip];
-
-    // println!("Looking up a function at index: {}", payload_size.to_usize());
-
-    let func = ctx
-        .thread
-        .global_env
-        .repl_lookup_idx(payload_size.to_usize());
-    ctx.handle_non_instr_global_function_call(func, args)
-}
-
-fn num_equal_handler_no_stack(ctx: &mut VmCore<'_>, l: SteelVal, r: SteelVal) -> Result<bool> {
+#[cfg(feature = "dynamic")]
+fn num_equal_handler_no_stack(_ctx: &mut VmCore<'_>, l: SteelVal, r: SteelVal) -> Result<bool> {
     if let SteelVal::BoolV(b) = number_equality(&l, &r)? {
         Ok(b)
     } else {
@@ -6304,6 +5850,7 @@ fn num_equal_handler_no_stack(ctx: &mut VmCore<'_>, l: SteelVal, r: SteelVal) ->
     }
 }
 
+#[cfg(feature = "dynamic")]
 // OpCode::LOADINT0
 fn handle_load_int0(ctx: &mut VmCore<'_>) -> Result<()> {
     ctx.thread.stack.push(SteelVal::INT_ZERO);
@@ -6311,6 +5858,7 @@ fn handle_load_int0(ctx: &mut VmCore<'_>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "dynamic")]
 // OpCode::LOADINT1
 fn handle_load_int1(ctx: &mut VmCore<'_>) -> Result<()> {
     ctx.thread.stack.push(SteelVal::INT_ONE);
@@ -6318,6 +5866,7 @@ fn handle_load_int1(ctx: &mut VmCore<'_>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "dynamic")]
 // OpCode::LOADINT2
 fn handle_load_int2(ctx: &mut VmCore<'_>) -> Result<()> {
     ctx.thread.stack.push(SteelVal::INT_TWO);
@@ -6325,48 +5874,57 @@ fn handle_load_int2(ctx: &mut VmCore<'_>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "dynamic")]
 // OpCode::MOVEREADLOCAL
 fn move_local_handler(ctx: &mut VmCore<'_>) -> Result<()> {
     let index = ctx.instructions[ctx.ip].payload_size;
     ctx.handle_move_local(index.to_usize())
 }
 
+#[cfg(feature = "dynamic")]
 // OpCode::MOVEREADLOCAL
 fn move_local_handler_with_payload(ctx: &mut VmCore<'_>, index: usize) -> Result<()> {
     ctx.handle_move_local(index)
 }
 
+#[cfg(feature = "dynamic")]
 // OpCode::MOVEREADLOCAL0
 fn move_local_handler0(ctx: &mut VmCore<'_>) -> Result<()> {
     ctx.handle_move_local(0)
 }
 
+#[cfg(feature = "dynamic")]
 // OpCode::MOVEREADLOCAL1
 fn move_local_handler1(ctx: &mut VmCore<'_>) -> Result<()> {
     ctx.handle_move_local(1)
 }
 
+#[cfg(feature = "dynamic")]
 // OpCode::MOVEREADLOCAL2
 fn move_local_handler2(ctx: &mut VmCore<'_>) -> Result<()> {
     ctx.handle_move_local(2)
 }
 
+#[cfg(feature = "dynamic")]
 // OpCode::MOVEREADLOCAL3
 fn move_local_handler3(ctx: &mut VmCore<'_>) -> Result<()> {
     ctx.handle_move_local(3)
 }
 
+#[cfg(feature = "dynamic")]
 // OpCode::READCAPTURED
 fn read_captured_handler(ctx: &mut VmCore<'_>) -> Result<()> {
     let payload_size = ctx.instructions[ctx.ip].payload_size;
     ctx.handle_read_captures(payload_size.to_usize())
 }
 
+#[cfg(feature = "dynamic")]
 // OpCode::READCAPTURED
 fn read_captured_handler_with_payload(ctx: &mut VmCore<'_>, payload_size: usize) -> Result<()> {
     ctx.handle_read_captures(payload_size)
 }
 
+#[cfg(feature = "dynamic")]
 // OpCode::BEGINSCOPE
 fn begin_scope_handler(ctx: &mut VmCore<'_>) -> Result<()> {
     ctx.ip += 1;
@@ -6417,6 +5975,7 @@ fn let_end_scope_handler_with_payload(ctx: &mut VmCore<'_>, beginning_scope: usi
     Ok(())
 }
 
+#[cfg(feature = "dynamic")]
 // OpCode::PUREFUNC
 fn pure_function_handler(ctx: &mut VmCore<'_>) -> Result<()> {
     let payload_size = ctx.instructions[ctx.ip].payload_size.to_usize();
@@ -6424,6 +5983,7 @@ fn pure_function_handler(ctx: &mut VmCore<'_>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "dynamic")]
 // OpCode::PUREFUNC
 fn pure_function_handler_with_payload(ctx: &mut VmCore<'_>, payload_size: usize) -> Result<()> {
     ctx.handle_pure_function(payload_size);
@@ -6605,7 +6165,7 @@ fn lte_handler_payload(ctx: &mut VmCore<'_>, payload: usize) -> Result<()> {
 }
 
 // OpCode::ALLOC
-fn alloc_handler(ctx: &mut VmCore<'_>) -> Result<()> {
+fn alloc_handler(_ctx: &mut VmCore<'_>) -> Result<()> {
     panic!("Deprecated now - this shouldn't be hit");
 
     /*
@@ -6638,7 +6198,7 @@ fn alloc_handler(ctx: &mut VmCore<'_>) -> Result<()> {
 
 // OpCode::READALLOC
 #[inline(always)]
-fn read_alloc_handler(ctx: &mut VmCore<'_>) -> Result<()> {
+fn read_alloc_handler(_ctx: &mut VmCore<'_>) -> Result<()> {
     panic!("Deprecated - this shouldn't be hit")
 
     /*
@@ -6663,7 +6223,7 @@ fn read_alloc_handler(ctx: &mut VmCore<'_>) -> Result<()> {
 
 // OpCode::SETALLOC
 #[inline(always)]
-fn set_alloc_handler(ctx: &mut VmCore<'_>) -> Result<()> {
+fn set_alloc_handler(_ctx: &mut VmCore<'_>) -> Result<()> {
     panic!("Deprecated - this shouldn't be hit")
 
     /*
@@ -6767,6 +6327,7 @@ mod handlers {
         Ok(())
     }
 
+    #[cfg(feature = "dynamic")]
     fn specialized_sub01(ctx: &mut VmCore<'_>) -> Result<()> {
         let offset = ctx.get_offset();
         // let offset = ctx.stack_frames.last().map(|x| x.index).unwrap_or(0);
@@ -6921,7 +6482,7 @@ mod handlers {
     // OpCode::PUSHCONST
     fn push_const_handler(ctx: &mut VmCore<'_>) -> Result<()> {
         let payload_size = ctx.instructions[ctx.ip].payload_size;
-        let val = ctx.constants.get(payload_size.to_usize());
+        let val = ctx.constants.get_value(payload_size.to_usize());
         ctx.thread.stack.push(val);
         ctx.ip += 1;
         Ok(())
@@ -6929,14 +6490,14 @@ mod handlers {
 
     pub fn push_const_handler_no_stack(ctx: &mut VmCore<'_>) -> Result<SteelVal> {
         let payload_size = ctx.instructions[ctx.ip].payload_size;
-        let val = ctx.constants.get(payload_size.to_usize());
+        let val = ctx.constants.get_value(payload_size.to_usize());
         ctx.ip += 1;
         Ok(val)
     }
 
     // OpCode::PUSHCONST
     fn push_const_handler_with_payload(ctx: &mut VmCore<'_>, payload: usize) -> Result<()> {
-        let val = ctx.constants.get(payload);
+        let val = ctx.constants.get_value(payload);
         ctx.thread.stack.push(val);
         ctx.ip += 1;
         Ok(())
